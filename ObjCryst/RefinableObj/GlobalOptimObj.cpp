@@ -559,7 +559,7 @@ OptimizationObj(""),
 mCurrentCost(-1),
 mTemperatureMax(1e6),mTemperatureMin(.001),mTemperatureGamma(1.0),
 mMutationAmplitudeMax(8.),mMutationAmplitudeMin(.125),mMutationAmplitudeGamma(1.0),
-mNbTrialRetry(0),mMinCostRetry(0)
+mNbTrialRetry(0),mMinCostRetry(0),mParticles(160),mFormerSpeed(0.721),mFormerMinima(1.193),mNeighbourhood(3) //// doladit pocet castic
 #ifdef __WX__CRYST__
 ,mpWXCrystObj(0)
 #endif
@@ -580,7 +580,7 @@ OptimizationObj(name),
 mCurrentCost(-1),
 mTemperatureMax(1e6),mTemperatureMin(.001),mTemperatureGamma(1.0),
 mMutationAmplitudeMax(8.),mMutationAmplitudeMin(.125),mMutationAmplitudeGamma(1.0),
-mNbTrialRetry(0),mMinCostRetry(0)
+mNbTrialRetry(0),mMinCostRetry(0), mParticles(160), mFormerSpeed(0.721), mFormerMinima(1.193), mNeighbourhood(3)
 #ifdef __WX__CRYST__
 ,mpWXCrystObj(0)
 #endif
@@ -603,7 +603,7 @@ mTemperatureMax(old.mTemperatureMax),mTemperatureMin(old.mTemperatureMin),
 mTemperatureGamma(old.mTemperatureGamma),
 mMutationAmplitudeMax(old.mMutationAmplitudeMax),mMutationAmplitudeMin(old.mMutationAmplitudeMin),
 mMutationAmplitudeGamma(old.mMutationAmplitudeGamma),
-mNbTrialRetry(old.mNbTrialRetry),mMinCostRetry(old.mMinCostRetry)
+mNbTrialRetry(old.mNbTrialRetry),mMinCostRetry(old.mMinCostRetry), mParticles(old.mParticles), mFormerSpeed(old.mFormerSpeed), mFormerMinima(old.mFormerMinima), mNeighbourhood(old.mNeighbourhood)
 #ifdef __WX__CRYST__
 ,mpWXCrystObj(0)
 #endif
@@ -622,7 +622,7 @@ OptimizationObj(""),
 mCurrentCost(-1),
 mTemperatureMax(.03),mTemperatureMin(.003),mTemperatureGamma(1.0),
 mMutationAmplitudeMax(16.),mMutationAmplitudeMin(.125),mMutationAmplitudeGamma(1.0),
-mNbTrialRetry(0),mMinCostRetry(0)
+mNbTrialRetry(0),mMinCostRetry(0), mParticles(160), mFormerSpeed(0.721), mFormerMinima(1.193), mNeighbourhood(3)
 #ifdef __WX__CRYST__
 ,mpWXCrystObj(0)
 #endif
@@ -725,6 +725,11 @@ void MonteCarloObj::Optimize(long &nbStep,const bool silent,const REAL finalcost
           this->RunRandomLSQMethod(cycles);
           break;
       }//case GLOBAL_OPTIM_GENETIC
+      case GLOBAL_OPTIM_PARTICLE_SWARM_OPTIMIZATION: //:TODO:
+      {
+          this->RunParticleSwarmOptimization(nbStep, silent, finalcost, maxTime);
+          break;
+      }//case GLOBAL_OPTIM_PARTICLE_SWARM_OPTIMIZATION
    }
    mIsOptimizing=false;
    #ifdef __WX__CRYST__
@@ -791,6 +796,9 @@ void MonteCarloObj::MultiRunOptimize(long &nbCycle,long &nbStep,const bool silen
    const long nbCycle0=nbCycle;
 	Chronometer chrono;
    mRun = 0;
+
+   const long paramsFirstStructure = mRefParList.CreateParamSet();
+
    while(nbCycle!=0)
    {
       if(!silent) cout <<"MonteCarloObj::MultiRunOptimize: Starting Run#"<<abs(nbCycle)<<endl;
@@ -818,6 +826,14 @@ void MonteCarloObj::MultiRunOptimize(long &nbCycle,long &nbStep,const bool silen
             catch(...){cout<<"Unhandled exception in MonteCarloObj::RunRandomLSQMethod() ?"<<endl;}
             //nbCycle=1;
             break;
+         }
+         case GLOBAL_OPTIM_PARTICLE_SWARM_OPTIMIZATION:
+         {
+             mRefParList.RestoreParamSet(paramsFirstStructure);
+             try{this->RunParticleSwarmOptimization(nbStep,silent,finalcost,maxTime);}
+             catch (...) { cout << "Unhandled exception in MonteCarloObj::RunParticleSwarmOptimization() ?" << endl; }
+             //nbCycle=1;
+             break;
          }
       }
       nbTrialCumul+=(nbStep0-nbStep);
@@ -901,6 +917,8 @@ void MonteCarloObj::MultiRunOptimize(long &nbCycle,long &nbStep,const bool silen
    #ifdef __WX__CRYST__
    mMutexStopAfterCycle.Unlock();
    #endif
+
+   mRefParList.ClearParamSet(paramsFirstStructure);
 
    if(finalcost>1)
       cout<<endl<<"Finished all runs, number of trials to reach cost="
@@ -1338,6 +1356,667 @@ void MonteCarloObj::RunRandomLSQMethod(long &nbCycle)
         }
     }
 }
+void MonteCarloObj::RunParticleSwarmOptimization(long &nbSteps, bool silent, double finalcost, double maxTime, double ScattTransl, double ScattConform, double ScattOrient)
+{
+    TAU_PROFILE("MonteCarloObj::RunParticleSwarmOptimization()", "void ()", TAU_DEFAULT);
+    TAU_PROFILE_TIMER(timer0a, "MonteCarloObj::RunParticleSwarmOptimization() Begin 1", "", TAU_FIELD);
+    TAU_PROFILE_TIMER(timer0b, "MonteCarloObj::RunParticleSwarmOptimization() Begin 2", "", TAU_FIELD);
+    TAU_PROFILE_TIMER(timer1, "MonteCarloObj::RunParticleSwarmOptimization() New Config + LLK", "", TAU_FIELD);
+    TAU_PROFILE_TIMER(timerN, "MonteCarloObj::RunParticleSwarmOptimization() Finish", "", TAU_FIELD);
+
+    // Keep a copy of the total number of steps,and decrement nbStep and number of free parameters
+    int nbStep = nbSteps;
+    mNbTrial = 0;
+    int NbFreePar = mRefParList.GetNbParNotFixed();
+
+    // time (in seconds) when last autoSave was made (if enabled)
+    unsigned long secondsWhenAutoSave = 0;
+
+    // Periodicity of the automatic LSQ refinements (if the option is set)
+    const unsigned int autoLSQPeriod = 150000;
+
+    if (!silent)
+        cout << "Starting Particle Swarm Optimization for " << nbSteps << " trials" << endl;
+
+    //if (!silent)
+        cout << "NbFreePar: " << NbFreePar << " nbPart: " << mParticles << endl;
+
+    if (NbFreePar <= 0 || mParticles <= 0 || mNeighbourhood >= mParticles)
+    {
+        cout << "Cannot run Particle Swarm Optimization due to invalid parameters." << endl;
+        return;
+    }
+
+    mCurrentCost = this->GetLogLikelihood();
+
+    // Create temporary variables to store best configuration and other configurations of particles
+    int bestParticle = 0;
+    const int nbPart = (int)mParticles;
+    CrystVector_long lastParSetIndex(mParticles);
+    double *costFunctionArray = new double[nbPart];
+    double *localMinimaCost = new double[nbPart];
+    int convergentionNumber = 0;
+    int currentIdenticalIterations = 0;
+    double prevBestCost = DBL_MAX;
+    double *x = new double[nbPart * NbFreePar];
+    double *v = new double[nbPart * NbFreePar];
+    double *M = new double[NbFreePar];
+    double *m = new double[nbPart * NbFreePar];
+    double runBestCost;
+
+    // Communication variables
+    int nbTrialsFromLastReport = 0;
+    int nbTryReport = 3000;
+    bool needUpdateDisplay = false;
+    bool makeReport = false;
+
+    // Change maximal change of different parameter types
+    for (int i = 0; i < NbFreePar; i++)
+    {
+        if (mRefParList.GetParNotFixed(i).GetType()->IsDescendantFromOrSameAs(gpRefParTypeScattTranslX))
+            mRefParList.GetParNotFixed(i).SetGlobalOptimStep(ScattTransl);
+        if (mRefParList.GetParNotFixed(i).GetType()->IsDescendantFromOrSameAs(gpRefParTypeScattTranslY))
+            mRefParList.GetParNotFixed(i).SetGlobalOptimStep(ScattTransl);
+        if (mRefParList.GetParNotFixed(i).GetType()->IsDescendantFromOrSameAs(gpRefParTypeScattTranslZ))
+            mRefParList.GetParNotFixed(i).SetGlobalOptimStep(ScattTransl);
+        if (mRefParList.GetParNotFixed(i).GetType()->IsDescendantFromOrSameAs(gpRefParTypeScattConformX))
+            mRefParList.GetParNotFixed(i).SetGlobalOptimStep(ScattConform);
+        if (mRefParList.GetParNotFixed(i).GetType()->IsDescendantFromOrSameAs(gpRefParTypeScattConformY))
+            mRefParList.GetParNotFixed(i).SetGlobalOptimStep(ScattConform);
+        if (mRefParList.GetParNotFixed(i).GetType()->IsDescendantFromOrSameAs(gpRefParTypeScattConformZ))
+            mRefParList.GetParNotFixed(i).SetGlobalOptimStep(ScattConform);
+        if (mRefParList.GetParNotFixed(i).GetType()->IsDescendantFromOrSameAs(gpRefParTypeScattOrient))
+            mRefParList.GetParNotFixed(i).SetGlobalOptimStep(ScattOrient);
+    }
+
+    // Create a temporary parameter set to store the best configuration and initial configuration
+    const long paramSetAtBegining = mRefParList.CreateParamSet("MonteCarloObj:First parameters (PSO)");
+    const long runBestIndex = mRefParList.CreateParamSet("MonteCarloObj:Last parameters (PSO)");
+
+    TAU_PROFILE_STOP(timer0a);
+    TAU_PROFILE_START(timer0b);
+
+    // Save time when the optimization started
+    Chronometer chrono;
+    chrono.start();
+    float lastUpdateDisplayTime = chrono.seconds();
+    TAU_PROFILE_STOP(timer0b);
+
+    // Initialize arrays x (positions), v (velocities), M (current global minimum position), and m (particle's minima positions)
+
+    // Initialize the particle's positions and velocities and calculate the cost function
+    for (int S = 0; S < nbPart; S++)
+    {
+        mRefParList.RestoreParamSet(paramSetAtBegining);
+        for (int i = 0; i < NbFreePar; i++)
+        {
+            double r_number1 = ((double)rand() / RAND_MAX - 0.5);
+            double r_number2 = ((double)rand() / RAND_MAX - 0.5);
+            double parValue = mRefParList.GetParNotFixed(i).GetValue();
+            x[S * NbFreePar + i] = move(parValue, r_number1, i);
+            v[S * NbFreePar + i] = r_number2;
+            m[S * NbFreePar + i] = x[S * NbFreePar + i];
+        }
+
+        lastParSetIndex(S) = mRefParList.CreateParamSet();
+        mRefParList.SaveParamSet(lastParSetIndex(S));
+        costFunctionArray[S] = this->GetLogLikelihood();
+        localMinimaCost[S] = costFunctionArray[S];
+        mCurrentCost = costFunctionArray[S];
+        if (costFunctionArray[S] < costFunctionArray[bestParticle] || S == 0)
+        {
+            mRefParList.RestoreParamSet(lastParSetIndex(S));
+            for (int i = 0; i < NbFreePar; i++)
+            {
+                M[i] = m[S * NbFreePar + i];
+            }
+            bestParticle = S;
+            mRefParList.SaveParamSet(runBestIndex);
+            runBestCost = costFunctionArray[bestParticle];
+            needUpdateDisplay = true;
+        }
+    }
+
+    prevBestCost = runBestCost;
+    bool changeOfGlobalMinimum = false;
+
+    // Initialize neighbourhoods
+    int K = mNeighbourhood;
+    int *neighbourhoods = new int[nbPart * K];
+    for (int i = 0; i < nbPart * K; i++)
+        neighbourhoods[i] = 0;
+   double w1 = 0.721;
+   double w2 = 0.721;
+   double c1i = 1.193;
+   double c1f = 1.193;
+   double c2i = 1.193;
+   double c2f = 1.193;
+
+    // Particle Swarm Optimization iteration cycle
+    for (int iteration = 0; iteration < nbStep; iteration = iteration + nbPart)
+    {
+        int accept = 0;
+        // Select neighbours
+        if (!changeOfGlobalMinimum)
+        {
+            for (int S = 0; S < nbPart; S++)
+                for (int k = 0; k < K; k++)
+                    neighbourhoods[S * K + k] = rand() % nbPart;
+        }
+      double w = (w1-w2)*(nbStep-iteration)/nbStep + w2;
+      double c1 = (c1f-c1i)*(iteration)/nbStep + c1i;
+      double c2 = (c2f-c2i)*(iteration)/nbStep + c2i;
+        changeOfGlobalMinimum = false;
+
+        // Move with all particles
+        for (int S = 0; S < nbPart; S++)
+        {
+            mRefParList.RestoreParamSet(lastParSetIndex(S));
+
+            double neighbourhoodMinimum = localMinimaCost[S];
+            int bestInHood = S;
+            for (int k = 0; k < K; k++)
+            {
+                if (localMinimaCost[neighbourhoods[S * K + k]] < neighbourhoodMinimum)
+                {
+                    neighbourhoodMinimum = localMinimaCost[neighbourhoods[S * K + k]];
+                    bestInHood = neighbourhoods[S * K + k];
+                }
+            }
+            if (S == bestInHood) // If the particle is the best in its neighbourhood the speed is calculated with the personal minimum only
+            {
+                for (int i = 0; i < NbFreePar; i++)
+                {
+                    v[S * NbFreePar + i] = w * v[S * NbFreePar + i] + c1 * (double)rand() / RAND_MAX * (m[S * NbFreePar + i] - x[S * NbFreePar + i]);
+                    x[S * NbFreePar + i] = move(x[S * NbFreePar + i], v[S * NbFreePar + i], i);
+                }
+            }
+            else // If the particle is not the best in its neighbourhood the speed is calculated with the personal and global minimum
+            {
+                for (int i = 0; i < NbFreePar; i++)
+                {
+                    v[S * NbFreePar + i] = w * v[S * NbFreePar + i] + c1 * (double)rand() / RAND_MAX * (m[bestInHood * NbFreePar + i] - x[S * NbFreePar + i]) + c2 * (double)rand() / RAND_MAX * (m[S * NbFreePar + i] - x[S * NbFreePar + i]);
+                    x[S * NbFreePar + i] = move(x[S * NbFreePar + i], v[S * NbFreePar + i], i);
+                }
+            }
+
+            // Calculate the cost function
+            costFunctionArray[S] = this->GetLogLikelihood();
+            mCurrentCost = costFunctionArray[S];
+            mRefParList.SaveParamSet(lastParSetIndex(S));
+        }
+
+        // Check for changes of minima
+        for (int S = 0; S < mParticles; S++)
+        {
+
+#if 0 // Creating trajectory for a particle
+        int particle = 0;
+        if (S == particle)
+        {
+           string filename = "for_ovito/para" + to_string((int)iteration/nbPart) + ".cif";
+           ofstream outputFile;
+           outputFile.open(filename, ios::out);
+           Crystal &myCrystal = dynamic_cast<Crystal &>(mRefinedObjList.GetObj("paracetamol_crystal"));
+           myCrystal.CIFOutput(outputFile);
+           outputFile.close();
+        }
+#endif
+#if 0 // Values of Loglikelihood for particle 26
+if(S==26){
+   string name = "res/particle26_" + to_string((int)mRun) + ".txt";
+        ofstream file(name, std::ios::app);
+        file << costFunctionArray[26] << std::endl;
+        file.close();
+}
+#endif
+            // If the cost function is lower than the personal minimum, the personal minimum is updated
+            if (costFunctionArray[S] < localMinimaCost[S])
+            {
+                localMinimaCost[S] = costFunctionArray[S];
+                for (int i = 0; i < NbFreePar; i++)
+                {
+                    m[S * NbFreePar + i] = x[S * NbFreePar + i];
+                }
+
+                // If the cost function is lower than the global minimum, the global minimum is updated
+                if (costFunctionArray[S] < runBestCost)
+                {
+                    runBestCost = costFunctionArray[S];
+                    needUpdateDisplay = true;
+                    mRefParList.RestoreParamSet(lastParSetIndex(S));
+                    mRefParList.SaveParamSet(runBestIndex);
+
+                    for (int i = 0; i < NbFreePar; i++)
+                    {
+                        M[i] = m[S * NbFreePar + i];
+                    }
+                    bestParticle = S;
+                    changeOfGlobalMinimum = true;
+
+                    // If the cost function is lower than the absolute cost from all runs, the absolute cost is updated
+                    if (runBestCost < mBestCost)
+                    {
+                        accept = 2;
+                        mBestCost = costFunctionArray[S];
+                        mRefParList.SaveParamSet(mBestParSavedSetIndex);
+                    }
+                }
+            }
+        }
+
+        // Autosave and update display
+        if (((mXMLAutoSave.GetChoice() == 1) && ((chrono.seconds() - secondsWhenAutoSave) > 86400)) || ((mXMLAutoSave.GetChoice() == 2) && ((chrono.seconds() - secondsWhenAutoSave) > 3600)) || ((mXMLAutoSave.GetChoice() == 3) && ((chrono.seconds() - secondsWhenAutoSave) > 600)) || ((mXMLAutoSave.GetChoice() == 4) && (accept == 2)))
+        {
+            secondsWhenAutoSave = (unsigned long)chrono.seconds();
+            string saveFileName = this->GetName();
+            time_t date = time(0);
+            char strDate[40];
+            strftime(strDate, sizeof(strDate), "%Y-%m-%d_%H-%M-%S", localtime(&date)); //%Y-%m-%dT%H:%M:%S%Z
+            char costAsChar[30];
+            mRefParList.RestoreParamSet(mBestParSavedSetIndex);
+            sprintf(costAsChar, "-Cost-%f", this->GetLogLikelihood());
+            saveFileName = saveFileName + (string)strDate + (string)costAsChar + (string) ".xml";
+            XMLCrystFileSaveGlobal(saveFileName);
+       }
+
+        // Update numbers of trials and steps
+        nbTrialsFromLastReport = nbTrialsFromLastReport + nbPart;
+        mNbTrial = mNbTrial + nbPart;
+        nbSteps = nbSteps - nbPart;
+
+        if (nbTrialsFromLastReport >= nbTryReport)
+        {
+            if (!silent)
+                cout << "Trial :" << mNbTrial << " Best Cost=" << mBestCost << " Current Cost=" << mCurrentCost << endl;
+            nbTrialsFromLastReport = 0;
+#ifdef __WX__CRYST__
+            if (0 != mpWXCrystObj)
+                mpWXCrystObj->UpdateDisplayNbTrial();
+#endif
+        }
+
+        // Automatic LSQ
+        if (mAutoLSQ.GetChoice() == 2)
+        {
+            if ((mNbTrial % autoLSQPeriod) < mParticles)
+            { 
+                // How many particles to LSQrefine
+                double bestPercent = 0.1;
+                int* indexes = new int[nbPart];
+                for (int i = 0; i < nbPart; ++i)
+                {
+                    indexes[i] = i;
+                }
+                partial_sort(indexes, indexes + int(nbPart * bestPercent), indexes + nbPart, [&](int a, int b)
+                             { return costFunctionArray[a] < costFunctionArray[b]; });
+
+                for (int i = 0; i < mRefinedObjList.GetNb(); i++)
+                    mRefinedObjList.GetObj(i).SetApproximationFlag(false);
+
+                for (int S = 0; S < nbPart * bestPercent; S++)
+                {
+#ifdef __WX__CRYST__
+                    mMutexStopAfterCycle.Lock();
+                    if (mStopAfterCycle)
+                    {
+                        mMutexStopAfterCycle.Unlock();
+                        break;
+                    }
+                    mMutexStopAfterCycle.Unlock();
+#endif
+
+                    mRefParList.RestoreParamSet(lastParSetIndex(indexes[S]));
+
+                    const REAL cost0 = this->GetLogLikelihood(); // cannot use currentCost(i), approximations changed...
+
+                    try
+                    {
+                        mLSQ.Refine(-30, true, true, false, 0.001);
+                    }
+                    catch (const ObjCrystException &except)
+                    {
+                    };
+                    REAL cost = this->GetLogLikelihood();
+                    if (!silent)
+                        cout << " -> " << cost << endl;
+                    if (cost < cost0)
+                    {
+                        mRefParList.SaveParamSet(lastParSetIndex(indexes[S]));
+
+                        // Update positions and personal minima
+                        for (int i = 0; i < NbFreePar; i++)
+                        {
+                            x[indexes[S] * NbFreePar + i] = move(x[indexes[S] * NbFreePar + i], 0, i);
+                            m[indexes[S] * NbFreePar + i] = x[indexes[S] * NbFreePar + i];
+                        }
+                    }
+                }
+                //  Need to go back to optimization with approximations allowed (they are not during LSQ)
+                for (int i = 0; i < mRefinedObjList.GetNb(); i++)
+                    mRefinedObjList.GetObj(i).SetApproximationFlag(true);
+
+                for (int S = 0; S < nbPart * bestPercent; S++)
+                {
+                    // And recompute LLK - since they will be lower
+                    mRefParList.RestoreParamSet(lastParSetIndex(indexes[S]));
+                    REAL cost = this->GetLogLikelihood();
+                    if (!silent)
+                        cout << "LSQ2:" << costFunctionArray[indexes[S]] << "->" << cost << endl;
+                    if (cost < costFunctionArray[indexes[S]])
+                    {
+                        mRefParList.SaveParamSet(lastParSetIndex(indexes[S]));
+                        costFunctionArray[indexes[S]] = cost;
+                        if (cost < runBestCost)
+                        {
+                            runBestCost = costFunctionArray[indexes[S]];
+                            this->TagNewBestConfig();
+                            needUpdateDisplay = true;
+                            bestParticle = indexes[S];
+                            mRefParList.SaveParamSet(runBestIndex);
+                            if (runBestCost < mBestCost)
+                            {
+                                mBestCost = costFunctionArray[bestParticle];
+                                mRefParList.SaveParamSet(mBestParSavedSetIndex);
+                                if (!silent)
+                                    this->DisplayReport();
+                            }
+                        }
+                    }
+                }
+                delete[] indexes;
+            }
+        }
+
+        if (true == makeReport)
+        {
+            makeReport = false;
+            if (!silent)
+            {
+                for (int i = 0; i < nbPart; i++)
+                {
+                    cout << "   Particle :" << lastParSetIndex(i) << ":";
+                    map<const RefinableObj *, LogLikelihoodStats>::iterator pos;
+                    for (pos = mvContextObjStats[i].begin(); pos != mvContextObjStats[i].end(); ++pos)
+                    {
+                        cout << pos->first->GetName()
+                             << "(LLK="
+                             << pos->second.mLastLogLikelihood
+                             << ", w=" << mvObjWeight[pos->first].mWeight
+                             << ")  ";
+                        pos->second.mTotalLogLikelihood = 0;
+                        pos->second.mTotalLogLikelihoodDeltaSq = 0;
+                    }
+                    cout << endl;
+                }
+                for (int i = 0; i < nbPart; i++)
+                {
+                    cout << "   Particle :" << lastParSetIndex(i)
+                         << " Current Cost=" << costFunctionArray[i];
+                }
+            }
+            if (!silent)
+                cout << "Trial :" << mNbTrial << " Best Cost=" << runBestCost << " ";
+            if (!silent)
+                chrono.print();
+        }
+
+        // Update display
+        if ((needUpdateDisplay && (lastUpdateDisplayTime < (chrono.seconds() - 1))) || (lastUpdateDisplayTime < (chrono.seconds() - 10)))
+        {
+            mRefParList.RestoreParamSet(runBestIndex);
+            this->UpdateDisplay();
+            needUpdateDisplay = false;
+            lastUpdateDisplayTime = chrono.seconds();
+        }
+
+#ifdef __WX__CRYST__
+        mMutexStopAfterCycle.Lock();
+#endif
+        if ((mBestCost < finalcost) || mStopAfterCycle || ((maxTime > 0) && (chrono.seconds() > maxTime)))
+        {
+#ifdef __WX__CRYST__
+            mMutexStopAfterCycle.Unlock();
+#endif
+            if (!silent)
+                cout << endl
+                     << endl
+                     << "Refinement Stopped." << endl;
+            break;
+        }
+#ifdef __WX__CRYST__
+        mMutexStopAfterCycle.Unlock();
+#endif
+
+        // Test for convergence
+        mRefParList.RestoreParamSet(runBestIndex);
+        if (prevBestCost == runBestCost)
+            currentIdenticalIterations++;
+        else
+            currentIdenticalIterations = 0;
+
+        if (convergentionNumber <= currentIdenticalIterations && converged(prevBestCost, x, v, currentIdenticalIterations, NbFreePar))
+        {
+            if (!silent)
+                cout << "Algorithm has converged after " << mNbTrial << " trials." << endl;
+            break;
+        }
+        prevBestCost = runBestCost;
+// #ifdef 0
+// string name = "res/loglikelyhood_" + to_string((int)mRun) + ".txt";
+//         ofstream file(name, std::ios::app);
+//         file << runBestCost << std::endl;
+//         file.close();
+// #endif
+    }
+    delete[] x;
+    delete[] v;
+    delete[] m;
+    delete[] M;
+    delete[] costFunctionArray;
+    delete[] localMinimaCost;
+    delete[] neighbourhoods;
+
+    TAU_PROFILE_START(timerN);
+    if (mAutoLSQ.GetChoice() > 0)
+    { // LSQ
+        if (!silent)
+            cout << "Beginning final LSQ refinement" << endl;
+        for (int i = 0; i < mRefinedObjList.GetNb(); i++)
+            mRefinedObjList.GetObj(i).SetApproximationFlag(false);
+        mRefParList.RestoreParamSet(runBestIndex);
+        mCurrentCost = this->GetLogLikelihood();
+        try
+        {
+            mLSQ.Refine(-50, true, true, false, 0.001);
+        }
+        catch (const ObjCrystException &except)
+        {
+        };
+        if (!silent)
+            cout << "LSQ cost: " << mCurrentCost << " -> " << this->GetLogLikelihood() << endl;
+
+        // Need to go back to optimization with approximations allowed (they are not during LSQ)
+        for (int i = 0; i < mRefinedObjList.GetNb(); i++)
+            mRefinedObjList.GetObj(i).SetApproximationFlag(true);
+
+        REAL cost = this->GetLogLikelihood();
+        if (cost < mCurrentCost)
+        {
+            mCurrentCost = cost;
+            mRefParList.SaveParamSet(runBestIndex);
+            if (mCurrentCost < runBestCost)
+            {
+                runBestCost = mCurrentCost;
+                mRefParList.SaveParamSet(runBestIndex);
+                if (runBestCost < mBestCost)
+                {
+                    mBestCost = mCurrentCost;
+                    mRefParList.SaveParamSet(mBestParSavedSetIndex);
+                    if (!silent)
+                        cout << "LSQ : NEW OVERALL Best Cost=" << runBestCost << endl;
+                }
+                else if (!silent)
+                    cout << " LSQ : NEW Run Best Cost=" << runBestCost << endl;
+            }
+        }
+        if (!silent)
+            cout << "Finished LSQ refinement" << endl;
+    }
+
+    // Restore the best parameter set and display the final report
+    mRefParList.RestoreParamSet(runBestIndex);
+    mCurrentCost = this->GetLogLikelihood();
+
+    mLastOptimTime = chrono.seconds();
+    if (!silent)
+        this->DisplayReport();
+    mCurrentCost = this->GetLogLikelihood();
+
+    if (!silent)
+        cout << "Run Best Cost:" << mCurrentCost << endl;
+    if (!silent)
+        chrono.print();
+
+    // Clear the temporary parameter sets created at the beginning
+    mRefParList.ClearParamSet(paramSetAtBegining);
+    for (int S = 0; S < nbPart; S++)
+        mRefParList.ClearParamSet(lastParSetIndex(S));
+    mRefParList.ClearParamSet(runBestIndex);
+    TAU_PROFILE_STOP(timerN);
+}
+
+// Sets Particle Swarm Optimization parameters
+void MonteCarloObj::SetAlgorithmParticleSwarmOptimization(int nbParticles, float parFormerSpeed, float parFormerMinima, int nbNeighbours)
+{
+    // Set optimization algorithm to Particle Swarm Optimization
+    VFN_DEBUG_MESSAGE("MonteCarloObj::SetAlgorithmParticleSwarmOptimization()", 5)
+    mGlobalOptimType.SetChoice(GLOBAL_OPTIM_PARTICLE_SWARM_OPTIMIZATION);
+    // Set PSO parameters
+    mParticles = nbParticles;
+    mFormerSpeed = parFormerSpeed;
+    mFormerMinima = parFormerMinima;
+    mNeighbourhood = nbNeighbours;
+    VFN_DEBUG_MESSAGE("MonteCarloObj::SetAlgorithmParticleSwarmOptimization():End", 3)
+}
+
+// Check if the algorithm has converged
+bool MonteCarloObj::converged(double prevBestCost, double *x, double *v, int sameValues, int NbFreePar)
+{
+    int option = 1;
+    switch (option)
+    {
+    case 0:
+    {
+        double distance = 0;
+        for (int S = 0; S < int(mParticles); S++)
+        {
+            for (int T = S; T < int(mParticles); T++)
+            {
+                for (int i = 0; i < NbFreePar; i++)
+                {
+                    distance = distance + (x[S * NbFreePar + i] - x[T * NbFreePar + i]) * (x[S * NbFreePar + i] - x[T * NbFreePar + i]);
+                }
+            }
+        }
+        if (distance > 1000)
+            return false;
+        break;
+    }
+    case 1:
+    {
+        double sumOfSpeeds = 0;
+        for (int i = 0; i < NbFreePar * int(mParticles); i++)
+            sumOfSpeeds = sumOfSpeeds + abs(v[i]);
+// #ifdef 0
+// string name = "res/speed_" + to_string((int)mRun) + ".txt";
+//         ofstream file(name, std::ios::app);
+//         file << sumOfSpeeds << std::endl;
+//         file.close();
+// #endif
+        //if (sumOfSpeeds/mParticles > 0.01)
+            return false;
+        break;
+    }
+    case 2:
+    {
+        double valueWithoutLSQ = this->GetLogLikelihood();
+        // LSQ
+        // Disable approximation flags for refined objects during LSQ refinement
+        for (int i = 0; i < mRefinedObjList.GetNb(); i++)
+            mRefinedObjList.GetObj(i).SetApproximationFlag(false);
+
+        // Perform the LSQ refinement
+        try
+        {
+            mLSQ.Refine(-50, true, true, false, 0.001);
+        }
+        catch (const ObjCrystException &except)
+        {
+        };
+
+        // Re-enable approximation flags for refined objects
+        for (int i = 0; i < mRefinedObjList.GetNb(); i++)
+            mRefinedObjList.GetObj(i).SetApproximationFlag(true);
+
+        // Calculate the cost after LSQ refinement
+        double cost = this->GetLogLikelihood();
+        if ((cost - valueWithoutLSQ) * (cost - valueWithoutLSQ) > 10000000)
+            return false;
+        break;
+    }
+    case 3:
+    {
+        if (mBestCost > 1000000)
+            return false;
+        break;
+    }
+    default:
+        break;
+    }
+
+    return true;
+}
+
+// Perform particle movement and constraint handling
+double MonteCarloObj::move(double x, double v, int i)
+{
+    // Update the particle's position with the given velocity
+    double mutationAmplitude = mRefParList.GetParNotFixed(i).GetGlobalOptimStep();
+    x = x + v * mutationAmplitude;
+
+    // Apply periodic or limited constraints if needed
+    if (true == mRefParList.GetParNotFixed(i).IsLimited())
+    {
+        const REAL min = mRefParList.GetParNotFixed(i).GetMin();
+        const REAL max = mRefParList.GetParNotFixed(i).GetMax();
+        if (x < min)
+        {
+            x = min;
+        }
+        else if (x > max)
+        {
+            x = max;
+        }
+    }
+    else if (true == mRefParList.GetParNotFixed(i).IsPeriodic())
+    {
+        const REAL period = mRefParList.GetParNotFixed(i).GetPeriod();
+        if (x < 0)
+        {
+            int times = (int)(x / period) - 1;
+            x = x - times * period;
+        }
+        if (x > period)
+        {
+            int times = (int)(x / period);
+            x = x - times * period;
+        }
+    }
+    mRefParList.GetParNotFixed(i).Mutate(v * mutationAmplitude);
+    x = mRefParList.GetParNotFixed(i).GetValue();
+    return x; // Return the updated particle's position
+}
 
 void MonteCarloObj::RunParallelTempering(long &nbStep,const bool silent,
                                          const REAL finalcost,const REAL maxTime)
@@ -1436,8 +2115,8 @@ void MonteCarloObj::RunParallelTempering(long &nbStep,const bool silent,
          worldCurrentSetIndex(i)=mRefParList.CreateParamSet();
          mRefParList.RestoreParamSet(worldCurrentSetIndex(nbWorld-1));
       }
-   TAU_PROFILE_STOP(timer0a);
-   TAU_PROFILE_START(timer0b);
+      TAU_PROFILE_STOP(timer0a);
+      TAU_PROFILE_START(timer0b);
       //mNbTrial=nbSteps;;
       const long lastParSavedSetIndex=mRefParList.CreateParamSet("MonteCarloObj:Last parameters (PT)");
       const long runBestIndex=mRefParList.CreateParamSet("Best parameters for current run (PT)");
@@ -2195,6 +2874,12 @@ void MonteCarloObj::XMLInput(istream &is,const XMLCrystTag &tagg)
          if(false==tag.IsEmptyTag()) XMLCrystTag junk(is);//:KLUDGE: for first release
          continue;
       }
+      if("NbOfParticles"==tag.GetName())
+      {
+         is>>mParticles;
+         if(false==tag.IsEmptyTag()) XMLCrystTag junk(is);//:KLUDGE: for first release
+         continue;
+      }
       if("RefinedObject"==tag.GetName())
       {
          string name,type;
@@ -2232,7 +2917,7 @@ void MonteCarloObj::InitOptions()
    VFN_DEBUG_MESSAGE("MonteCarloObj::InitOptions()",5)
    this->OptimizationObj::InitOptions();
    static string GlobalOptimTypeName;
-   static string GlobalOptimTypeChoices[2];//:TODO: Add Genetic Algorithm
+   static string GlobalOptimTypeChoices[3];//:TODO: Add Genetic Algorithm
 
    static string AnnealingScheduleChoices[6];
 
@@ -2252,6 +2937,7 @@ void MonteCarloObj::InitOptions()
       GlobalOptimTypeChoices[0]="Simulated Annealing";
       GlobalOptimTypeChoices[1]="Parallel Tempering";
       //GlobalOptimTypeChoices[2]="Random-LSQ";
+      GlobalOptimTypeChoices[2] = "Particle Swarm Optimization";
 
       AnnealingScheduleTempName="Temperature Schedule";
       AnnealingScheduleMutationName="Displacement Amplitude Schedule";
@@ -2273,7 +2959,7 @@ void MonteCarloObj::InitOptions()
 
       needInitNames=false;//Only once for the class
    }
-   mGlobalOptimType.Init(2,&GlobalOptimTypeName,GlobalOptimTypeChoices);
+   mGlobalOptimType.Init(3,&GlobalOptimTypeName,GlobalOptimTypeChoices);
    mAnnealingScheduleTemp.Init(6,&AnnealingScheduleTempName,AnnealingScheduleChoices);
    mAnnealingScheduleMutation.Init(6,&AnnealingScheduleMutationName,AnnealingScheduleChoices);
    mSaveTrackedData.Init(2,&saveTrackedDataName,saveTrackedDataChoices);

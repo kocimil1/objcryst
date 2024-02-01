@@ -83,6 +83,7 @@ enum GlobalOptimType
 {
    GLOBAL_OPTIM_SIMULATED_ANNEALING,
    GLOBAL_OPTIM_PARALLEL_TEMPERING,
+   GLOBAL_OPTIM_PARTICLE_SWARM_OPTIMIZATION,
    GLOBAL_OPTIM_RANDOM_LSQ,
    GLOBAL_OPTIM_SIMULATED_ANNEALING_MULTI,
    GLOBAL_OPTIM_PARALLEL_TEMPERING_MULTI,
@@ -491,6 +492,11 @@ class MonteCarloObj:public OptimizationObj
       /// Update Display (if any display is available), when a new 'relevant' configuration
       /// is reached. This calls all RefinableObj::UpdateDisplay()
       virtual void UpdateDisplay() const;
+
+      void SetAlgorithmParticleSwarmOptimization(int nbParticles = 160, float parFormerSpeed = 0.721,
+                               float parFormerMinima = 1.193, int nbNeighbours = 3);
+      void RunParticleSwarmOptimization(long &nbSteps, bool silent = false, double finalcost = 0,
+                               double maxTime = -1, double ScattTransl = 1.0, double ScattConform = 0.1, double ScattOrient = 1.0);
    protected:
 
       /** \brief Make a random change in the configuration.
@@ -559,6 +565,20 @@ class MonteCarloObj:public OptimizationObj
       LSQNumObj mLSQ;
       /// Option to run automatic least-squares refinements
       RefObjOpt mAutoLSQ;
+            // Parameters for Particle Swarm Optimization
+        // Number of particles
+        REAL mParticles;
+        // How much do the itterations depend on former speed parameter
+        REAL mFormerSpeed;
+        // How much does this itteration depend on found minima parameter
+        REAL mFormerMinima;
+        // Parameter of neighbourhood \96 controling exploation
+        REAL mNeighbourhood;
+        // Convergence condition
+        bool converged(double prevBestCost, double* x, double* v, int sameValues, int NbFreePar);
+        double move(double x, double v, int i);
+        // assigning particle neighbourhood
+        //bool neighbourhoodControl(int i, int k, int K, int* neighbourhoods);
    private:
    #ifdef __WX__CRYST__
    public:
